@@ -1,0 +1,119 @@
+● 현재 접속 계정 기준으로 쿼리를 작성할게요. 데이터 보관 최초일자는 테이블별 날짜 컬럼이 달라서 PL/SQL 방식으로 자동 탐지하는 스크립트까지 같이 드릴게요.
+
+  ---
+  1단계 - 메인 쿼리 (데이터 보관 최초일자 제외)
+
+  모니터링 플러시 먼저 실행 후 사용:
+
+  -- 모니터링 정보 메모리 → 딕셔너리 반영 (최근 DML 기준 사용여부에 필요)
+  EXEC DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO;
+
+  SELECT
+      t.table_name                                                          AS "테이블명",
+      NVL(tc.comments, '-')                                                AS "테이블 설명",
+      CASE
+          WHEN NVL(m.inserts,0)+NVL(m.updates,0)+NVL(m.deletes,0) > 0    THEN 'Y'
+          WHEN t.last_analyzed IS NOT NULL                                  THEN 'Y'
+          ELSE 'N'
+      END                                                                   AS "사용여부",
+      '→ 2단계 참조'                                                        AS "데이터 보관 최초일자",
+      CASE
+          WHEN MONTHS_BETWEEN(SYSDATE, obj.created) > 0
+           AND NVL(t.num_rows, 0) > 0
+          THEN ROUND(t.num_rows / MONTHS_BETWEEN(SYSDATE, obj.created), 0)
+          ELSE NVL(t.num_rows, 0)
+      END                                                                   AS "월평균 생성건수(추정)",
+      col.cnt                                                               AS "칼럼수",
+      ROUND(NVL(seg.bytes, 0) / 1024 / 1024, 2)                          AS "전체 용량(MB)"
+  FROM
+      user_tables t
+      JOIN user_objects obj
+          ON  obj.object_name = t.table_name
+          AND obj.object_type = 'TABLE'
+      LEFT JOIN user_tab_comments tc
+          ON  tc.table_name = t.table_name
+      LEFT JOIN (
+          SELECT table_name, COUNT(*) AS cnt
+          FROM   user_tab_columns
+          GROUP  BY table_name
+      ) col ON col.table_name = t.table_name
+      LEFT JOIN (
+          SELECT segment_name, SUM(bytes) AS bytes
+          FROM   user_segments
+          WHERE  segment_type IN ('TABLE','TABLE PARTITION','TABLE SUBPARTITION')
+          GROUP  BY segment_name
+      ) seg ON seg.segment_name = t.table_name
+      LEFT JOIN (
+          SELECT table_name,
+                 SUM(inserts)  AS inserts,
+                 SUM(updates)  AS updates,
+                 SUM(deletes)  AS deletes
+          FROM   user_tab_modifications
+          WHERE  partition_name IS NULL
+          GROUP  BY table_name
+      ) m ON m.table_name = t.table_name
+  ORDER BY
+      t.table_name;
+
+  ---
+  2단계 - 데이터 보관 최초일자 (PL/SQL 자동 탐지)
+
+  각 테이블에서 DATE/TIMESTAMP 타입 컬럼 중 생성일 패턴(%CRE%, %REG%, %INS%, %FIRST%, %OPEN%)을 우선 탐지하고, 없으면 첫 번째 날짜 컬럼 기준으로 MIN 조회합니다.
+
+  SET SERVEROUTPUT ON SIZE UNLIMITED
+
+  DECLARE
+      v_sql      VARCHAR2(1000);
+      v_min_date VARCHAR2(30);
+      v_col      VARCHAR2(128);
+  BEGIN
+      DBMS_OUTPUT.PUT_LINE(RPAD('테이블명', 35) || RPAD('기준 컬럼', 35) || '최초 데이터 일자');
+      DBMS_OUTPUT.PUT_LINE(RPAD('-', 100, '-'));
+
+      FOR t IN (SELECT table_name FROM user_tables ORDER BY table_name)
+      LOOP
+          v_col := NULL;
+
+          -- 1순위: 생성일 패턴 컬럼
+          BEGIN
+              SELECT column_name INTO v_col
+              FROM (
+                  SELECT column_name,
+                         CASE
+                             WHEN column_name LIKE '%CRE%'   THEN 1
+                             WHEN column_name LIKE '%REG%'   THEN 2
+                             WHEN column_name LIKE '%INS%'   THEN 3
+                             WHEN column_name LIKE '%FIRST%' THEN 4
+                             WHEN column_name LIKE '%OPEN%'  THEN 5
+                             ELSE 9
+                         END AS priority
+                  FROM   user_tab_columns
+                  WHERE  table_name = t.table_name
+                  AND    data_type IN ('DATE','TIMESTAMP','TIMESTAMP(6)')
+                  ORDER  BY priority, column_id
+              )
+              WHERE ROWNUM = 1;
+          EXCEPTION WHEN NO_DATA_FOUND THEN v_col := NULL;
+          END;
+
+          IF v_col IS NULL THEN
+              GOTO next_table;
+          END IF;
+
+          -- MIN 값 동적 조회
+          BEGIN
+              v_sql := 'SELECT TO_CHAR(MIN(' || v_col || '),''YYYY-MM-DD'') FROM ' || t.table_name;
+              EXECUTE IMMEDIATE v_sql INTO v_min_date;
+          EXCEPTION WHEN OTHERS THEN
+              v_min_date := 'ERROR: ' || SQLERRM;
+          END;
+
+          DBMS_OUTPUT.PUT_LINE(
+              RPAD(t.table_name, 35) ||
+              RPAD(v_col, 35) ||
+              NVL(v_min_date, '(데이터 없음)')
+          );
+
+          <<next_table>> NULL;
+      END LOOP;
+  END;
