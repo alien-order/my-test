@@ -1,0 +1,301 @@
+================================================================================
+테이블 사용여부 판단 쿼리 - Q3(v$sql_plan) 활용
+================================================================================
+판단 기준:
+  Q3 있음 (SELECT 흔적)                              → Y (조회전용 사용중)
+  Q3 없음 + INSERT 있음                              → Y (DML 사용중)
+  Q3 없음 + INSERT 없음 + 건수 > 0 + 마스터 패턴    → 확인필요 (마스터추정)
+  Q3 없음 + INSERT 없음 + 건수 > 0 + 패턴 없음      → 확인필요
+  Q3 없음 + INSERT 없음 + 건수 = 0  (통계기준)       → N
+  Q3 없음 + INSERT 없음 + 건수 미확인 (통계미수집)   → 확인필요 (통계미수집)
+
+필요 권한:
+  - user_tables, user_tab_modifications, user_tab_comments : 기본 권한
+  - v$sql_plan, v$sqlarea : SELECT ANY DICTIONARY 권한 필요
+    → 권한 확인: SELECT * FROM session_privs WHERE privilege LIKE '%DICT%';
+================================================================================
+
+
+-- ============================================================================
+-- STEP 0. 사전 준비
+-- ============================================================================
+
+-- DML 모니터링 정보를 메모리 → 딕셔너리로 반영 (INSERT/UPDATE/DELETE 최신화)
+EXEC DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO;
+
+-- v$sql_plan 접근 권한 확인 (결과 없으면 권한 없음 → DBA에게 요청)
+SELECT privilege
+FROM   session_privs
+WHERE  privilege IN ('SELECT ANY DICTIONARY','SELECT ANY TABLE','DBA');
+
+
+-- ============================================================================
+-- STEP 1. 메인 쿼리
+-- ============================================================================
+WITH
+
+-- ── Q3: Library Cache(공유 풀 메모리) 에 남아 있는 SELECT 흔적 ──────────────
+-- 현재 메모리에 올라와 있는 SQL 실행 계획 기준이므로
+-- 메모리에서 밀려난 SQL 은 조회되지 않음 → 없다고 해서 미사용 확정 아님
+q3_select AS (
+    SELECT  sp.object_name                   AS table_name,
+            COUNT(DISTINCT sa.sql_id)        AS select_sql_cnt,
+            MAX(sa.last_active_time)         AS last_select_time,
+            MAX(sa.executions)               AS max_executions
+    FROM    v$sql_plan sp
+    JOIN    v$sqlarea  sa
+            ON  sa.sql_id       = sp.sql_id
+    WHERE   sp.object_owner     = USER
+      AND   sp.object_name      IS NOT NULL
+      AND   sp.object_type      LIKE 'TABLE%'   -- TABLE, TABLE (TEMP) 등 포함
+    GROUP   BY sp.object_name
+),
+
+-- ── DML 이력 (마지막 통계 수집 이후 누적) ────────────────────────────────────
+dml_hist AS (
+    SELECT  table_name,
+            SUM(inserts)        AS inserts,
+            SUM(updates)        AS updates,
+            SUM(deletes)        AS deletes,
+            MAX(timestamp)      AS last_dml_time
+    FROM    user_tab_modifications
+    WHERE   partition_name IS NULL          -- 테이블 단위 집계 (파티션 제외)
+    GROUP   BY table_name
+),
+
+-- ── 마스터성 테이블 패턴 감지 ────────────────────────────────────────────────
+-- 테이블명에 아래 키워드가 포함되면 마스터 테이블로 추정
+-- 실제 환경에 맞게 패턴 추가/수정 가능
+master_chk AS (
+    SELECT  table_name,
+            CASE
+                WHEN REGEXP_LIKE(table_name,
+                     -- 코드성
+                     'CODE|COCD|_COD$|_COD_|^COD_|_CD$|_CD_|^CD_'   ||'|'||
+                     -- 마스터/기준
+                     'MST|MASTER|BASE|BASIS|STD|STANDARD'             ||'|'||
+                     -- 공통
+                     'CMM|COMMON|COM_|_COM$|COMM'                     ||'|'||
+                     -- 유형/종류
+                     'TYPE|_TYP$|_TYP_|KIND|_KND'                    ||'|'||
+                     -- 상태
+                     'STAT|STATUS|STS'                                 ||'|'||
+                     -- 분류/그룹
+                     'GRP|GROUP|CLASS|CATG|CATEGORY|_DIV$|_DIV_'     ||'|'||
+                     -- 설정/파라미터
+                     'CONFIG|CONF|PARAM|SETTING|_SET$'                ||'|'||
+                     -- 기타
+                     'META|MENU|ROLE|AUTH|PERMISSION|POLICY',
+                     'i'  -- 대소문자 무시
+                )
+                THEN 'Y'
+                ELSE 'N'
+            END AS is_master
+    FROM    user_tables
+)
+
+-- ── 최종 조합 ────────────────────────────────────────────────────────────────
+SELECT
+    t.table_name                                            AS "테이블명",
+    NVL(tc.comments, '-')                                   AS "테이블설명",
+
+    -- ── 사용여부 판단 ──────────────────────────────────────────────────────
+    CASE
+        -- Q3 흔적 있음: Library Cache 에 SELECT 가 남아 있음
+        WHEN q3.table_name IS NOT NULL
+            THEN 'Y (조회전용)'
+        -- Q3 없음 + DML 이력 있음
+        WHEN NVL(m.inserts,0) + NVL(m.updates,0) + NVL(m.deletes,0) > 0
+            THEN 'Y (DML사용중)'
+        -- Q3 없음 + DML 없음 + 통계 기준 빈 테이블
+        WHEN t.num_rows = 0
+            THEN 'N'
+        -- Q3 없음 + DML 없음 + 통계 미수집 (num_rows IS NULL)
+        WHEN t.num_rows IS NULL
+            THEN '확인필요 (통계미수집)'
+        -- Q3 없음 + DML 없음 + 건수 있음 + 마스터 패턴
+        WHEN t.num_rows > 0 AND mc.is_master = 'Y'
+            THEN '확인필요 (마스터추정)'
+        -- Q3 없음 + DML 없음 + 건수 있음 + 패턴 없음
+        WHEN t.num_rows > 0
+            THEN '확인필요'
+        ELSE 'N'
+    END                                                     AS "사용여부판단",
+
+    -- ── Q3 SELECT 흔적 ────────────────────────────────────────────────────
+    CASE WHEN q3.table_name IS NOT NULL THEN 'Y' ELSE 'N' END
+                                                            AS "Q3_SELECT흔적",
+    TO_CHAR(q3.last_select_time, 'YYYY-MM-DD HH24:MI')     AS "최근SELECT시각",
+    NVL(q3.select_sql_cnt, 0)                               AS "SELECT_SQL수",
+    NVL(q3.max_executions, 0)                               AS "최대실행횟수",
+
+    -- ── DML 이력 ──────────────────────────────────────────────────────────
+    NVL(m.inserts, 0)                                       AS "최근INSERT건",
+    NVL(m.updates, 0)                                       AS "최근UPDATE건",
+    NVL(m.deletes, 0)                                       AS "최근DELETE건",
+    TO_CHAR(m.last_dml_time, 'YYYY-MM-DD HH24:MI')         AS "최근DML시각",
+
+    -- ── 테이블 기본 정보 ───────────────────────────────────────────────────
+    NVL(t.num_rows, -1)                                     AS "추정건수(통계)",
+    mc.is_master                                            AS "마스터패턴",
+    TO_CHAR(obj.created,       'YYYY-MM-DD')                AS "테이블생성일",
+    TO_CHAR(t.last_analyzed,   'YYYY-MM-DD')                AS "통계수집일",
+    TO_CHAR(obj.last_ddl_time, 'YYYY-MM-DD')                AS "마지막DDL일"
+
+FROM
+    user_tables t
+
+    JOIN  user_objects obj
+          ON  obj.object_name = t.table_name
+          AND obj.object_type = 'TABLE'
+
+    LEFT  JOIN user_tab_comments tc
+          ON  tc.table_name = t.table_name
+
+    LEFT  JOIN dml_hist m
+          ON  m.table_name = t.table_name
+
+    LEFT  JOIN q3_select q3
+          ON  q3.table_name = t.table_name
+
+    LEFT  JOIN master_chk mc
+          ON  mc.table_name = t.table_name
+
+ORDER BY
+    -- 사용여부 판단 순서대로 정렬
+    CASE
+        WHEN q3.table_name IS NOT NULL                                           THEN 1
+        WHEN NVL(m.inserts,0)+NVL(m.updates,0)+NVL(m.deletes,0) > 0            THEN 2
+        WHEN NVL(t.num_rows,0) > 0 AND mc.is_master = 'Y'                       THEN 3
+        WHEN NVL(t.num_rows,0) > 0                                               THEN 4
+        WHEN t.num_rows IS NULL                                                   THEN 5
+        ELSE 6
+    END,
+    t.table_name;
+
+
+-- ============================================================================
+-- STEP 2. 사용여부 집계 요약
+-- ============================================================================
+-- STEP 1 쿼리를 WITH 절로 감싸서 집계하거나, 별도로 아래만 실행
+
+WITH q3_select AS (
+    SELECT sp.object_name AS table_name
+    FROM   v$sql_plan sp
+    JOIN   v$sqlarea  sa ON sa.sql_id = sp.sql_id
+    WHERE  sp.object_owner = USER
+      AND  sp.object_name  IS NOT NULL
+      AND  sp.object_type  LIKE 'TABLE%'
+    GROUP  BY sp.object_name
+),
+dml_hist AS (
+    SELECT table_name,
+           SUM(inserts) AS inserts,
+           SUM(updates) AS updates,
+           SUM(deletes) AS deletes
+    FROM   user_tab_modifications
+    WHERE  partition_name IS NULL
+    GROUP  BY table_name
+),
+master_chk AS (
+    SELECT table_name,
+           CASE WHEN REGEXP_LIKE(table_name,
+                'CODE|COCD|_CD$|_CD_|MST|MASTER|BASE|STD|CMM|COMMON|'||
+                'TYPE|KIND|STAT|STATUS|GRP|GROUP|CLASS|CATG|CONFIG|PARAM|META|'||
+                'MENU|ROLE|AUTH|PERMISSION|POLICY', 'i')
+                THEN 'Y' ELSE 'N' END AS is_master
+    FROM   user_tables
+),
+판단 AS (
+    SELECT
+        CASE
+            WHEN q3.table_name IS NOT NULL                                         THEN 'Y (조회전용)'
+            WHEN NVL(m.inserts,0)+NVL(m.updates,0)+NVL(m.deletes,0) > 0          THEN 'Y (DML사용중)'
+            WHEN t.num_rows = 0                                                    THEN 'N'
+            WHEN t.num_rows IS NULL                                                THEN '확인필요 (통계미수집)'
+            WHEN t.num_rows > 0 AND mc.is_master = 'Y'                            THEN '확인필요 (마스터추정)'
+            WHEN t.num_rows > 0                                                    THEN '확인필요'
+            ELSE 'N'
+        END AS 사용여부판단
+    FROM   user_tables t
+    LEFT   JOIN dml_hist   m  ON m.table_name  = t.table_name
+    LEFT   JOIN q3_select  q3 ON q3.table_name = t.table_name
+    LEFT   JOIN master_chk mc ON mc.table_name = t.table_name
+)
+SELECT 사용여부판단,
+       COUNT(*) AS 테이블수
+FROM   판단
+GROUP  BY 사용여부판단
+ORDER  BY 테이블수 DESC;
+
+
+-- ============================================================================
+-- 참고: Q3 조회 불가 시 (권한 없을 때) 대체 쿼리
+-- v$sql_plan 제외, DML 이력 + 마스터 패턴만 사용
+-- ============================================================================
+/*
+EXEC DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO;
+
+WITH dml_hist AS (
+    SELECT table_name,
+           SUM(inserts) AS inserts,
+           SUM(updates) AS updates,
+           SUM(deletes) AS deletes
+    FROM   user_tab_modifications
+    WHERE  partition_name IS NULL
+    GROUP  BY table_name
+),
+master_chk AS (
+    SELECT table_name,
+           CASE WHEN REGEXP_LIKE(table_name,
+                'CODE|COCD|_CD$|_CD_|MST|MASTER|BASE|STD|CMM|COMMON|'||
+                'TYPE|KIND|STAT|STATUS|GRP|GROUP|CLASS|CATG|CONFIG|PARAM|META|'||
+                'MENU|ROLE|AUTH|PERMISSION|POLICY', 'i')
+                THEN 'Y' ELSE 'N' END AS is_master
+    FROM   user_tables
+)
+SELECT
+    t.table_name,
+    NVL(tc.comments, '-') AS 테이블설명,
+    CASE
+        WHEN NVL(m.inserts,0)+NVL(m.updates,0)+NVL(m.deletes,0) > 0 THEN 'Y (DML사용중)'
+        WHEN t.num_rows = 0                                           THEN 'N'
+        WHEN t.num_rows IS NULL                                       THEN '확인필요 (통계미수집)'
+        WHEN t.num_rows > 0 AND mc.is_master = 'Y'                   THEN '확인필요 (마스터추정)'
+        WHEN t.num_rows > 0                                           THEN '확인필요'
+        ELSE 'N'
+    END AS 사용여부판단,
+    NVL(m.inserts,0) AS 최근INSERT건,
+    NVL(t.num_rows,-1) AS 추정건수,
+    mc.is_master AS 마스터패턴
+FROM   user_tables t
+LEFT   JOIN user_tab_comments tc ON tc.table_name = t.table_name
+LEFT   JOIN dml_hist           m  ON m.table_name  = t.table_name
+LEFT   JOIN master_chk         mc ON mc.table_name = t.table_name
+ORDER  BY t.table_name;
+*/
+
+
+-- ============================================================================
+-- 해석 가이드
+-- ============================================================================
+-- Y (조회전용)         : v$sql_plan에 SELECT 흔적 있음 → 실사용 확정
+--                        단, 메모리에서 밀려난 SQL은 보이지 않음
+--
+-- Y (DML사용중)        : 마지막 통계 수집 이후 INSERT/UPDATE/DELETE 발생
+--                        DBMS_STATS 실행 시 카운터 초기화됨
+--
+-- 확인필요 (마스터추정): Q3 흔적 없고 DML 없지만 데이터 있고 이름이 마스터 패턴
+--                        → 실제로는 사용 중일 가능성 높음
+--                        → 담당자 확인 또는 추가 감사(AUDIT) 설정 권장
+--
+-- 확인필요              : Q3 없음 + DML 없음 + 데이터 있음 + 패턴 없음
+--                        → Library Cache에서 SQL이 밀려났거나 진짜 미사용
+--                        → 담당자 확인 필요
+--
+-- 확인필요 (통계미수집): DBMS_STATS 한 번도 안 돌린 테이블 → 건수 불명
+--                        → EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, '테이블명') 실행 후 재확인
+--
+-- N                    : 통계 기준 건수 0 + Q3 없음 + DML 없음 → 미사용 가능성 높음
+--                        단, 통계가 오래된 경우 실제 데이터가 있을 수 있으므로
+--                        중요 테이블은 COUNT(*) 직접 확인 권장
