@@ -89,6 +89,16 @@ WARN_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="sol
 # =============================================================================
 # 유틸
 # =============================================================================
+def _decode_val(v):
+    """Oracle row 값 중 bytes → str 변환 (CP949 fallback)"""
+    if isinstance(v, bytes):
+        try:
+            return v.decode('utf-8')
+        except UnicodeDecodeError:
+            return v.decode('cp949', errors='replace')
+    return v
+
+
 def fmt_gb(bytes_val) -> str:
     if not bytes_val:
         return "0.0GB"
@@ -107,7 +117,7 @@ def make_conn(cfg: Dict):
 
 def fetchall_dict(cur) -> List[Dict]:
     cols = [d[0].lower() for d in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+    return [dict(zip(cols, (_decode_val(v) for v in row))) for row in cur.fetchall()]
 
 
 def parse_cell(ref: str) -> Tuple[int, int]:
@@ -327,7 +337,7 @@ def _try_parse_varchar_date(val: str) -> bool:
         if len(s) >= min_len and re.match(pattern, s):
             return True
     try:
-        dateutil_parser.parse(s, yearfirst=True)
+        dateutil_parser.parse(s, yearfirst=True, ignoretz=True)
         return True
     except Exception:
         return False
@@ -405,7 +415,7 @@ def get_first_date(conn, table_name: str, num_rows, date_col: Optional[str],
                     except Exception:
                         pass
                 try:
-                    return dateutil_parser.parse(s).strftime("%Y-%m-%d")
+                    return dateutil_parser.parse(s, ignoretz=True).strftime("%Y-%m-%d")
                 except Exception:
                     return s[:10]
         except Exception:
@@ -461,10 +471,11 @@ def _read_lob(val):
         return None
     if hasattr(val, "read"):
         try:
-            return val.read()
+            data = val.read()
+            return _decode_val(data) if isinstance(data, bytes) else data
         except Exception:
             return str(val)
-    return val
+    return _decode_val(val)
 
 
 def fetch_sample(conn, table_name: str, date_col: Optional[str]):
