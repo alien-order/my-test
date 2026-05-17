@@ -1,119 +1,156 @@
-● 현재 접속 계정 기준으로 쿼리를 작성할게요. 데이터 보관 최초일자는 테이블별 날짜 컬럼이 달라서 PL/SQL 방식으로 자동 탐지하는 스크립트까지 같이 드릴게요.
+table_survey.py 좋았어. 근데 2개의 버전으로 나눠줄게
 
-  ---
-  1단계 - 메인 쿼리 (데이터 보관 최초일자 제외)
+ROWNUM, 시스템명, 테이블명, 테이블 설명, 사용 여부, 데이터 보관 최초일자, 1개월 평균 데이터 생성 건수, 칼럼수(개), 전체 테이블 용량
+는 공통으로 2가지 버전 모두 나오지만
+이제 db스키마는 3개야
+1. PROD
+2. ARCHIVE
+3. INFA
 
-  모니터링 플러시 먼저 실행 후 사용:
+첫번째 버전에서는 PROD랑 INFA로 할거거든
+그래서 PROD DB 모든 테이블을 일단 df에 넣어놓고
 
-  -- 모니터링 정보 메모리 → 딕셔너리 반영 (최근 DML 기준 사용여부에 필요)
-  EXEC DBMS_STATS.FLUSH_DATABASE_MONITORING_INFO;
+사용여부는
 
-  SELECT
-      t.table_name                                                          AS "테이블명",
-      NVL(tc.comments, '-')                                                AS "테이블 설명",
-      CASE
-          WHEN NVL(m.inserts,0)+NVL(m.updates,0)+NVL(m.deletes,0) > 0    THEN 'Y'
-          WHEN t.last_analyzed IS NOT NULL                                  THEN 'Y'
-          ELSE 'N'
-      END                                                                   AS "사용여부",
-      '→ 2단계 참조'                                                        AS "데이터 보관 최초일자",
-      CASE
-          WHEN MONTHS_BETWEEN(SYSDATE, obj.created) > 0
-           AND NVL(t.num_rows, 0) > 0
-          THEN ROUND(t.num_rows / MONTHS_BETWEEN(SYSDATE, obj.created), 0)
-          ELSE NVL(t.num_rows, 0)
-      END                                                                   AS "월평균 생성건수(추정)",
-      col.cnt                                                               AS "칼럼수",
-      ROUND(NVL(seg.bytes, 0) / 1024 / 1024, 2)                          AS "전체 용량(MB)"
-  FROM
-      user_tables t
-      JOIN user_objects obj
-          ON  obj.object_name = t.table_name
-          AND obj.object_type = 'TABLE'
-      LEFT JOIN user_tab_comments tc
-          ON  tc.table_name = t.table_name
-      LEFT JOIN (
-          SELECT table_name, COUNT(*) AS cnt
-          FROM   user_tab_columns
-          GROUP  BY table_name
-      ) col ON col.table_name = t.table_name
-      LEFT JOIN (
-          SELECT segment_name, SUM(bytes) AS bytes
-          FROM   user_segments
-          WHERE  segment_type IN ('TABLE','TABLE PARTITION','TABLE SUBPARTITION')
-          GROUP  BY segment_name
-      ) seg ON seg.segment_name = t.table_name
-      LEFT JOIN (
-          SELECT table_name,
-                 SUM(inserts)  AS inserts,
-                 SUM(updates)  AS updates,
-                 SUM(deletes)  AS deletes
-          FROM   user_tab_modifications
-          WHERE  partition_name IS NULL
-          GROUP  BY table_name
-      ) m ON m.table_name = t.table_name
-  ORDER BY
-      t.table_name;
+WITH
 
-  ---
-  2단계 - 데이터 보관 최초일자 (PL/SQL 자동 탐지)
+-- Q3: 현재 Library Cache (수 시간 ~ 수 일)
+q3_select AS (
+    SELECT  sp.object_name                  AS table_name,
+            MAX(sa.last_active_time)        AS last_select_time
+    FROM    v$sql_plan sp
+    JOIN    v$sqlarea  sa ON sa.sql_id = sp.sql_id
+    WHERE   sp.object_owner = USER
+      AND   sp.object_name  IS NOT NULL
+      AND   sp.object_type  LIKE 'TABLE%'
+    GROUP   BY sp.object_name
+),
 
-  각 테이블에서 DATE/TIMESTAMP 타입 컬럼 중 생성일 패턴(%CRE%, %REG%, %INS%, %FIRST%, %OPEN%)을 우선 탐지하고, 없으면 첫 번째 날짜 컬럼 기준으로 MIN 조회합니다.
+-- ASH: AWR 이력 (기본 8일치 / 설정에 따라 다름)
+ash_access AS (
+    SELECT  o.object_name                                          AS table_name,
+            COUNT(*)                                               AS ash_cnt,
+            COUNT(CASE WHEN ash.sql_opname = 'SELECT' THEN 1 END) AS ash_select,
+            COUNT(CASE WHEN ash.sql_opname IN (
+                       'INSERT','UPDATE','DELETE','MERGE') THEN 1 END) AS ash_dml,
+            TO_CHAR(MAX(ash.sample_time), 'YYYY-MM-DD HH24:MI')   AS last_ash_time
+    FROM    dba_hist_active_sess_history ash
+    JOIN    dba_objects o
+            ON  o.object_id  = ash.current_obj#
+            AND o.owner       = USER
+            AND o.object_type = 'TABLE'
+    WHERE   ash.sample_time >= SYSDATE - 8   -- AWR 보관 기간에 맞게 조정
+      AND   ash.current_obj# > 0
+    GROUP   BY o.object_name
+),
 
-  SET SERVEROUTPUT ON SIZE UNLIMITED
+-- DML 이력 (통계 수집 이후 누적)
+dml_hist AS (
+    SELECT  table_name,
+            SUM(inserts) AS inserts,
+            SUM(updates) AS updates,
+            SUM(deletes) AS deletes
+    FROM    user_tab_modifications
+    WHERE   partition_name IS NULL
+    GROUP   BY table_name
+),
 
-  DECLARE
-      v_sql      VARCHAR2(1000);
-      v_min_date VARCHAR2(30);
-      v_col      VARCHAR2(128);
-  BEGIN
-      DBMS_OUTPUT.PUT_LINE(RPAD('테이블명', 35) || RPAD('기준 컬럼', 35) || '최초 데이터 일자');
-      DBMS_OUTPUT.PUT_LINE(RPAD('-', 100, '-'));
+-- 마스터 패턴
+master_chk AS (
+    SELECT  table_name,
+            CASE WHEN REGEXP_LIKE(table_name,
+                 'CODE|COCD|_CD$|_CD_|MST|MASTER|BASE|STD|CMM|COMMON|'||
+                 'TYPE|KIND|STAT|STATUS|GRP|GROUP|CLASS|CATG|CONFIG|PARAM|META|'||
+                 'MENU|ROLE|AUTH|PERMISSION|POLICY', 'i')
+                 THEN 'Y' ELSE 'N' END AS is_master
+    FROM    user_tables
+)
 
-      FOR t IN (SELECT table_name FROM user_tables ORDER BY table_name)
-      LOOP
-          v_col := NULL;
+SELECT
+    t.table_name                                            AS "테이블명",
+    NVL(tc.comments, '-')                                  AS "테이블설명",
 
-          -- 1순위: 생성일 패턴 컬럼
-          BEGIN
-              SELECT column_name INTO v_col
-              FROM (
-                  SELECT column_name,
-                         CASE
-                             WHEN column_name LIKE '%CRE%'   THEN 1
-                             WHEN column_name LIKE '%REG%'   THEN 2
-                             WHEN column_name LIKE '%INS%'   THEN 3
-                             WHEN column_name LIKE '%FIRST%' THEN 4
-                             WHEN column_name LIKE '%OPEN%'  THEN 5
-                             ELSE 9
-                         END AS priority
-                  FROM   user_tab_columns
-                  WHERE  table_name = t.table_name
-                  AND    data_type IN ('DATE','TIMESTAMP','TIMESTAMP(6)')
-                  ORDER  BY priority, column_id
-              )
-              WHERE ROWNUM = 1;
-          EXCEPTION WHEN NO_DATA_FOUND THEN v_col := NULL;
-          END;
+    -- ── 최종 사용여부 판단 (우선순위 순) ────────────────────────────────────
+    CASE
+        -- 1순위: ASH에 SELECT 샘플 있음 → 확실한 조회 사용 (기간 내 실접근 증거)
+        WHEN ash.ash_select > 0
+            THEN 'Y (ASH-SELECT확인)'
+        -- 2순위: ASH에 DML 샘플 있음
+        WHEN ash.ash_dml > 0
+            THEN 'Y (ASH-DML확인)'
+        -- 3순위: Q3 Library Cache에 SELECT 흔적
+        WHEN q3.table_name IS NOT NULL
+            THEN 'Y (Q3-SELECT흔적)'
+        -- 4순위: DML 모니터링 이력
+        WHEN NVL(m.inserts,0)+NVL(m.updates,0)+NVL(m.deletes,0) > 0
+            THEN 'Y (DML이력)'
+        -- 5순위: 건수 없음 → 미사용
+        WHEN t.num_rows = 0
+            THEN 'N'
+        -- 6순위: 통계 미수집
+        WHEN t.num_rows IS NULL
+            THEN '확인필요 (통계미수집)'
+        -- 7순위: 데이터 있음 + 마스터 패턴
+        WHEN t.num_rows > 0 AND mc.is_master = 'Y'
+            THEN '확인필요 (마스터추정)'
+        -- 8순위: 데이터 있으나 흔적 없음
+        WHEN t.num_rows > 0
+            THEN '확인필요'
+        ELSE 'N'
+    END                                                     AS "사용여부판단",
 
-          IF v_col IS NULL THEN
-              GOTO next_table;
-          END IF;
+    -- 근거 컬럼
+    NVL(ash.ash_select, 0)                                 AS "ASH_SELECT샘플",
+    NVL(ash.ash_dml, 0)                                    AS "ASH_DML샘플",
+    ash.last_ash_time                                       AS "ASH_최근접근",
+    CASE WHEN q3.table_name IS NOT NULL THEN 'Y' ELSE 'N' END AS "Q3흔적",
+    NVL(m.inserts,0)                                       AS "DML_INSERT",
+    NVL(t.num_rows,-1)                                     AS "추정건수(통계)",
+    mc.is_master                                            AS "마스터패턴"
 
-          -- MIN 값 동적 조회
-          BEGIN
-              v_sql := 'SELECT TO_CHAR(MIN(' || v_col || '),''YYYY-MM-DD'') FROM ' || t.table_name;
-              EXECUTE IMMEDIATE v_sql INTO v_min_date;
-          EXCEPTION WHEN OTHERS THEN
-              v_min_date := 'ERROR: ' || SQLERRM;
-          END;
+FROM
+    user_tables t
+    LEFT JOIN user_tab_comments              tc  ON  tc.table_name  = t.table_name
+    LEFT JOIN dml_hist                       m   ON  m.table_name   = t.table_name
+    LEFT JOIN q3_select                      q3  ON  q3.table_name  = t.table_name
+    LEFT JOIN ash_access                     ash ON  ash.table_name = t.table_name
+    LEFT JOIN master_chk                     mc  ON  mc.table_name  = t.table_name
 
-          DBMS_OUTPUT.PUT_LINE(
-              RPAD(t.table_name, 35) ||
-              RPAD(v_col, 35) ||
-              NVL(v_min_date, '(데이터 없음)')
-          );
+ORDER BY
+    CASE
+        WHEN NVL(ash.ash_select,0) > 0                                    THEN 1
+        WHEN NVL(ash.ash_dml,0) > 0                                       THEN 2
+        WHEN q3.table_name IS NOT NULL                                     THEN 3
+        WHEN NVL(m.inserts,0)+NVL(m.updates,0)+NVL(m.deletes,0) > 0      THEN 4
+        WHEN NVL(t.num_rows,0) > 0 AND mc.is_master = 'Y'                 THEN 5
+        WHEN NVL(t.num_rows,0) > 0                                         THEN 6
+        WHEN t.num_rows IS NULL                                             THEN 7
+        ELSE 8
+    END,
+    t.table_name;
 
-          <<next_table>> NULL;
-      END LOOP;
-  END;
+
+이걸 바탕으로 테이블명과 사용여부,
+데이터 최초보관일자는 table_survey.py 처럼 최초일자를 계산하지만 만약에 데이터가 0개면 - 으로 표시
+최초일자 근거 컬럼이 있으면 그걸로 표시, 근거 컬럼이 없으면 테이블 생성일로 하자
+
+그리고 df 엑셀 저장 시 기존 폼 엑셀에 덮어쓰고 싶은데 그 덮어쓸 엑셀파일을 지정할 수 있도록 하고
+번호데이터 부터 들어갈 셀을 정할수있도록 예로 B4 이런식으로 번호 , C4에 시스템명, D4에 테이블명 이런식으로 들어가는거지
+그리고 각 번호를 누르면 그 번호의 테이블명 의 샘플데이터 시트로 이동해야하고 시트명은 그 번호거든,
+
+데이터 최초보관일자가 있으면 그 근거컬럼의 최근데이터 10개씩으로 하자
+
+그리고 이걸
+PROD만 하는 버전,
+PROD+ARCHIVE 랑 INFA 하는 버전 두개로 따로 만들거야
+
+그래서 첫번째 버전은 스키마를 하나만 입력할 거고
+두번째 버전은 스키마를 세개 입력하는 것이고 최초보관일자, 1개월 평균 데이터 생성건수, 전체 테이블 용량은
+PROD랑 ARCHIVE를 합산해서 계산해야해, 그리고 여기는 첫번째버전보다 테이블이 더 나올수도 있겠지
+그래서 여기는 엑셀에 표시를 하나 더하자, PROD랑 ARCHIVE 에 둘다 테이블이 있으면 Combined
+PROD에만 있으면 Prod Only, ARCHIVE에만 있으면 Archive Only 이렇게 표시할 수 있도록, INFA는 INFA로 표시할 수 있도록
+
+보고 이해했는지 말해주고 이해한 내용 readme 로 작성
+
+
+
