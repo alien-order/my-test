@@ -3,7 +3,8 @@
     "allow": [
       "PowerShell(\\(Get-Content C:\\\\workspace\\\\my-test\\\\survey_v1.py | Measure-Object -Line\\).Lines; \\(Get-Content C:\\\\workspace\\\\my-test\\\\survey_v2.py | Measure-Object -Line\\).Lines)",
       "Bash(python *)",
-      "Bash(py *)"
+      "Bash(py *)",
+      "Bash(del _conv.py)"
     ]
   }
 }
